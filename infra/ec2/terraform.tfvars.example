@@ -1,0 +1,9 @@
+region = "ap-northeast-2"
+availability_zone = "ap-northeast-2a"
+auth_hostname = "auth.example.com"
+acme_email = "operator@example.com"
+bootstrap_parameter_name = "/ai-signal/keycloak/bootstrap"
+instance_type = "t3.medium"
+
+# Use an existing PUBLIC subnet instead of creating a VPC:
+# existing_network = { vpc_id = "vpc-REPLACE", subnet_id = "subnet-REPLACE" }
