@@ -1,0 +1,102 @@
+#!/bin/bash
+set -euo pipefail
+# Never enable shell tracing: decrypted secrets are read below.
+dnf install -y docker jq awscli2
+systemctl enable --now docker
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl --fail --location --retry 4 https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose
+DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${volume_id}
+for n in $(seq 1 120); do test -b "$DEVICE" && break; sleep 5; done
+test -b "$DEVICE"
+if ! blkid "$DEVICE" >/dev/null; then mkfs.ext4 "$DEVICE"; fi
+mkdir -p /srv/keycloak
+UUID=$(blkid -s UUID -o value "$DEVICE")
+grep -q "$UUID" /etc/fstab || echo "UUID=$UUID /srv/keycloak ext4 defaults,nofail 0 2" >> /etc/fstab
+mount /srv/keycloak
+chmod 700 /srv/keycloak
+cd /srv/keycloak
+umask 077
+aws ssm get-parameter --region '${region}' --name '${parameter}' --with-decryption --query Parameter.Value --output text > bootstrap.json
+# Require env-file-safe random values; recommend openssl rand -hex 32.
+jq -e '.db_password | test("^[A-Za-z0-9_-]{24,}$")' bootstrap.json >/dev/null
+jq -e '.admin_password | test("^[A-Za-z0-9_-]{24,}$")' bootstrap.json >/dev/null
+printf 'DB_PASSWORD=%s\nADMIN_PASSWORD=%s\n' "$(jq -r .db_password bootstrap.json)" "$(jq -r .admin_password bootstrap.json)" > .env
+rm bootstrap.json
+cat > compose.yaml <<'COMPOSE'
+services:
+  postgres:
+    image: ${postgres_image}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: $${DB_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  keycloak:
+    image: ${keycloak_image}
+    command: [start]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:8080:8080
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: $${DB_PASSWORD}
+      KC_BOOTSTRAP_ADMIN_USERNAME: bootstrap-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: $${ADMIN_PASSWORD}
+      KC_HOSTNAME: https://${hostname}
+      KC_HOSTNAME_ADMIN: http://localhost:8080
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+  caddy:
+    image: ${caddy_image}
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+COMPOSE
+cat > Caddyfile <<'CADDY'
+{
+  email ${email}
+}
+${hostname} {
+  @blocked path /admin /admin/* /realms/master /realms/master/* /metrics /health /health/*
+  respond @blocked 404
+  reverse_proxy keycloak:8080 {
+    header_up X-Forwarded-Proto https
+    header_up X-Forwarded-Host ${hostname}
+    header_up X-Forwarded-Port 443
+  }
+}
+CADDY
+cat > /etc/systemd/system/keycloak-stack.service <<'UNIT'
+[Unit]
+Description=Keycloak PostgreSQL Caddy stack
+After=docker.service network-online.target
+Requires=docker.service
+RequiresMountsFor=/srv/keycloak
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/srv/keycloak
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now keycloak-stack
